@@ -1,5 +1,6 @@
 /vendor/
 /composer.lock
+/.merge-plan.php
 /.phpunit.result.cache
 /.phpunit.cache/
 /runtime/
