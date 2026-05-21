@@ -1,205 +1,237 @@
-# yii3-spawn — план интеграции Yii3 с TrueAsync server
+# yii3-spawn — Yii3 + TrueAsync server integration plan
 
-Документ описывает, как адаптировать фреймворк **Yii3** для работы под
-[TrueAsync server](https://github.com/true-async/server). За основу взяты уже
-существующие адаптеры `symfony-spawn` и `laravel-spawn` — у них одинаковый
-архитектурный каркас, который переносится на Yii3.
-
----
-
-## 1. Цель
-
-Запустить обычное Yii3-приложение на TrueAsync-сервере так, чтобы:
-
-- приложение собиралось **один раз на воркер** (DI-контейнер, маршруты, конфиг);
-- внутри воркера запросы обрабатывались **конкурентно**, каждый в своей корутине;
-- **код приложения не менялся** — контроллеры, middleware, ActiveRecord, шаблоны
-  работают как обычно;
-- состояние, привязанное к запросу, было изолировано между корутинами.
+This document describes how to adapt the **Yii3** framework to run on the
+[TrueAsync server](https://github.com/true-async/server). It builds on the
+existing `symfony-spawn` and `laravel-spawn` adapters — they share one
+architectural skeleton, which is carried over to Yii3.
 
 ---
 
-## 2. Как работает TrueAsync server и что показывают существующие адаптеры
+## 1. Goal
 
-TrueAsync server (`TrueAsync\HttpServer`) — это многопоточный HTTP-сервер на корутинах:
+Run a standard Yii3 application on the TrueAsync server so that:
 
-- `spawn_thread()` поднимает N воркеров (обычно по числа ядер);
-- в каждом воркере `HttpServer` принимает соединения и на каждый запрос спавнит
-  корутину;
-- корутины внутри одного воркера разделяют память процесса — то есть **все
-  синглтоны и статика общие**;
-- `Async\request_context()` даёт хранилище, изолированное по корутине/скоупу — это
-  ключевой примитив изоляции.
+- the application is built **once per worker** (DI container, routes, config);
+- requests inside a worker are handled **concurrently**, each in its own coroutine;
+- **application code is unchanged** — controllers, middleware, ActiveRecord, and
+  templates work as usual;
+- request-scoped state is isolated between coroutines.
 
-`symfony-spawn` и `laravel-spawn` решают одну и ту же задачу одинаково:
+---
 
-| Слой | Назначение |
+## 2. How the TrueAsync server works and what the existing adapters show
+
+The TrueAsync server (`TrueAsync\HttpServer`) is a multi-threaded coroutine HTTP server:
+
+- `spawn_thread()` starts N workers (usually one per CPU core);
+- inside each worker `HttpServer` accepts connections and spawns a coroutine per
+  request;
+- coroutines within one worker share the process memory — so **all singletons and
+  statics are shared**;
+- `Async\request_context()` provides storage isolated per coroutine/scope — this is
+  the key isolation primitive.
+
+`symfony-spawn` and `laravel-spawn` solve the same problem the same way:
+
+| Layer | Purpose |
 |---|---|
-| **Runtime / Runner** | точка входа; поднимает воркеры через `spawn_thread`, в каждом строит ядро фреймворка и запускает `HttpServer` |
-| **Server adapter** | конвертирует `TrueAsync\HttpRequest` ↔ объект запроса фреймворка и обратно для ответа |
-| **Per-coroutine адаптеры** | оборачивают stateful-синглтоны, перенося их изменяемое состояние в `request_context()` |
-| **DB pool + транзакции** | включают C-уровневый пул PDO TrueAsync и изолируют вложенность транзакций по корутине |
-| **Memory hygiene** | сбрасывают накопленное за запрос состояние (identity map и пр.) |
+| **Runtime / Runner** | entry point; starts workers via `spawn_thread`, builds the framework kernel in each and launches `HttpServer` |
+| **Server adapter** | converts `TrueAsync\HttpRequest` ↔ the framework request object and back for the response |
+| **Per-coroutine adapters** | wrap stateful singletons, moving their mutable state into `request_context()` |
+| **DB pool + transactions** | enable the TrueAsync C-level PDO pool and isolate transaction nesting per coroutine |
+| **Memory hygiene** | reset state accumulated during a request (identity map, etc.) |
 
-Главная мысль: **разделяемое read-only состояние остаётся общим** (конфиг,
-определения маршрутов, кэш переводов), **изменяемое per-request состояние —
-изолируется**.
+Core idea: **shared read-only state stays shared** (config, route definitions,
+translation caches), while **mutable per-request state is isolated**.
 
 ---
 
-## 3. Архитектура Yii3 и где она ломается под concurrency
+## 3. Yii3 architecture and where it breaks under concurrency
 
-Yii3 устроен заметно удобнее Yii2 и Symfony для async:
+Yii3 is noticeably friendlier to async than Yii2 and Symfony:
 
-- **нет глобального `Yii::$app`** — никакого God-синглтона;
-- запрос (`Psr\Http\Message\ServerRequestInterface`) — это **локальная
-  переменная**, протекающая через PSR-15 middleware-стек, а не синглтон. Это
-  снимает самую больную проблему Yii2/Symfony;
-- DI-контейнер `Yiisoft\Di\Container` строится из групп конфигов
+- **no global `Yii::$app`** — no God singleton;
+- the request (`Psr\Http\Message\ServerRequestInterface`) is a **local variable**
+  flowing through the PSR-15 middleware stack, not a singleton. This removes the
+  worst Yii2/Symfony problem;
+- the DI container `Yiisoft\Di\Container` is built from config groups
   (`di-web`, `di-providers-web`, ...);
-- HTTP-приложение — `Yiisoft\Yii\Http\Application`: `start()`, далее
-  `handle(ServerRequestInterface): ResponseInterface` через `MiddlewareDispatcher`,
-  затем `afterEmit()` / `shutdown()`;
-- раннеры (`Yiisoft\Yii\Runner\ApplicationRunner`, реализации `RunnerInterface`)
-  уже абстрагируют точку входа — есть HTTP-раннер (`HttpApplicationRunner`) и
-  RoadRunner-раннер;
-- **уже существует `Yiisoft\Di\StateResetter`** — между запросами RoadRunner-раннер
-  вызывает `StateResetter::reset()`, сбрасывая stateful-сервисы.
+- the HTTP application is `Yiisoft\Yii\Http\Application`: `start()`, then
+  `handle(ServerRequestInterface): ResponseInterface` through `MiddlewareDispatcher`,
+  then `afterEmit()` / `shutdown()`;
+- runners (`Yiisoft\Yii\Runner\ApplicationRunner`, `RunnerInterface` implementations)
+  already abstract the entry point — there is an HTTP runner (`HttpApplicationRunner`)
+  and a RoadRunner runner;
+- **`Yiisoft\Di\StateResetter` already exists** — between requests the RoadRunner
+  runner calls `StateResetter::reset()` to clear stateful services.
 
-### В чём проблема
+### The problem
 
-`StateResetter` рассчитан на **последовательное** переиспользование воркера
-(RoadRunner: один запрос за раз). Под TrueAsync N корутин работают **одновременно**
-в одном воркере — «сброс между запросами» здесь некорректен: запросы перекрываются
-во времени. Поэтому stateful-синглтоны, которые в RoadRunner-режиме просто
-сбрасываются, под async нужно **изолировать по корутине**.
+`StateResetter` is designed for **sequential** worker reuse (RoadRunner: one request
+at a time). Under TrueAsync, N coroutines run **concurrently** in one worker — a
+"reset between requests" is incorrect here, because requests overlap in time. So the
+stateful singletons that the RoadRunner mode simply resets must instead be
+**isolated per coroutine** under async.
 
-### Stateful-синглтоны Yii3, требующие изоляции
+### Yii3 stateful singletons that need isolation
 
-| Синглтон | Что хранит | Когда мутируется |
+| Singleton | What it holds | When it mutates |
 |---|---|---|
-| `Yiisoft\Router\CurrentRoute` | сматченный маршрут, аргументы, URI | router middleware |
-| `Yiisoft\User\CurrentUser` | аутентифицированная identity, кэш проверок прав | auth middleware, код приложения |
-| `Yiisoft\Session\SessionInterface` | данные сессии, флеш-сообщения | весь жизненный цикл запроса |
-| `Yiisoft\RequestProvider\RequestProvider` | текущий `ServerRequest` для не-middleware кода | `RequestCatcherMiddleware` |
-| View state (`Yiisoft\View\View` / `ViewRenderer`) | общие параметры шаблонов, блоки, заголовок | контроллеры, layout |
-| Error handler | сохранённый текущий запрос для отрисовки ошибки | при исключении |
-| `Yiisoft\Db\Connection\ConnectionInterface` | объект активной транзакции, уровень savepoint | `transaction()` / `beginTransaction()` |
+| `Yiisoft\Router\CurrentRoute` | matched route, arguments, URI | router middleware |
+| `Yiisoft\User\CurrentUser` | authenticated identity, permission-check cache | auth middleware, app code |
+| `Yiisoft\Session\SessionInterface` | session data, flash messages | whole request lifecycle |
+| `Yiisoft\RequestProvider\RequestProvider` | current `ServerRequest` for non-middleware code | `RequestCatcherMiddleware` |
+| View state (`Yiisoft\View\View` / `ViewRenderer`) | shared template parameters, blocks, title | controllers, layout |
+| Error handler | the stored current request for error rendering | on exception |
+| `Yiisoft\Db\Connection\ConnectionInterface` | the active transaction object, savepoint level | `transaction()` / `beginTransaction()` |
 
-Всё остальное (определения контейнера, маршруты, конфиг, translation-loader,
-DBAL-схема) — read-only после сборки и безопасно для общего доступа.
+Everything else (container definitions, routes, config, translation loader, DB
+schema) is read-only after build and safe to share.
 
 ---
 
-## 4. Стратегия адаптации
+## 4. Adaptation strategy
 
-**Выбрана: общий контейнер + изоляция состояния через `request_context()`**
-(тот же подход, что в `symfony-spawn` / `laravel-spawn`).
+**Chosen: shared container + state isolation via `request_context()`**
+(the same approach as `symfony-spawn` / `laravel-spawn`).
 
-- контейнер строится один раз на воркер;
-- каждая корутина-запрос работает в собственном дочернем `Scope`, поэтому
-  `request_context()` уникален для запроса;
-- проблемные синглтоны заменяются на async-варианты через **DI-делегаты/декораторы**
-  в отдельной группе конфигов (`di-web` override), которую подключает наш раннер;
-- замена прозрачна: классы реализуют те же интерфейсы Yii3, что и оригиналы.
+- the container is built once per worker;
+- each request coroutine runs in its own child `Scope`, so `request_context()` is
+  unique per request;
+- the problematic singletons are replaced with async variants via **DI
+  delegates/decorators** in a separate config group (`di-web` override) wired in by
+  our runner;
+- the replacement is transparent: the classes implement the same Yii3 interfaces as
+  the originals.
 
-Альтернатива — отдельный дочерний контейнер на корутину — отклонена: `Yiisoft\Di\Container`
-не предназначен для дешёвого порождения child-контейнеров, и пересборка
-request-scoped сервисов на каждый запрос дороже точечной изоляции.
+The alternative — a separate child container per coroutine — is rejected:
+`Yiisoft\Di\Container` is not meant for cheap child-container creation, and
+rebuilding request-scoped services per request is more expensive than targeted
+isolation.
 
 ---
 
-## 5. Компоненты-адаптеры
+## 5. Adapter components
 
-| Компонент | Адаптер (`TrueAsync\Yii3\…`) | Что изолируется |
+| Component | Adapter (`TrueAsync\Yii3\…`) | What is isolated |
 |---|---|---|
-| Runner | `Runtime\TrueAsyncRunner` | точка входа: воркеры + `HttpServer` |
+| Runner | `Runtime\TrueAsyncRunner` | entry point: workers + `HttpServer` |
 | Server | `Server\TrueAsyncServer` | `HttpRequest` ↔ PSR-7 ↔ `HttpResponse` |
-| PSR-7 мост | `Server\PsrRequestFactory` / `PsrResponseEmitter` | конвертация запроса/ответа |
-| Текущий маршрут | `Router\AsyncCurrentRoute` | сматченный маршрут на корутину |
-| Аутентификация | `User\AsyncCurrentUser` | identity и кэш прав на корутину |
-| Сессия | `Session\AsyncSession` | данные сессии и флеш на корутину |
-| Request provider | `Http\AsyncRequestProvider` | текущий `ServerRequest` на корутину |
-| View | `View\AsyncViewState` | общие параметры/блоки шаблона на корутину |
-| БД: драйвер | `Db\TrueAsyncPgsqlDriver` | PDO с пулом TrueAsync (пароль в DSN, errmode arg3) |
-| БД: транзакции | `Db\AsyncTransactionState` | уровень вложенности/savepoint на корутину |
-| DI | `Di\AsyncConfigGroup` (config-набор) | подмена синглтонов на async-версии |
-| Гигиена памяти | `Runtime\RequestCleanup` | сброс identity map / state после запроса |
+| PSR-7 bridge | `Server\PsrRequestFactory` / `PsrResponseEmitter` | request/response conversion |
+| Current route | `Router\AsyncCurrentRoute` | matched route per coroutine |
+| Authentication | `User\AsyncCurrentUser` | identity and permission cache per coroutine |
+| Session | `Session\AsyncSession` | session data and flash per coroutine |
+| Request provider | `Http\AsyncRequestProvider` | current `ServerRequest` per coroutine |
+| View | `View\AsyncViewState` | shared template params/blocks per coroutine |
+| DB: driver | `Db\TrueAsyncPgsqlDriver` | a single overridden `createConnection()` (see below) |
+| DB: transactions | `Db\AsyncTransactionState` | nesting/savepoint level per coroutine |
+| DI | `Di\AsyncConfigGroup` (config set) | swap singletons for async versions |
+| Memory hygiene | `Runtime\RequestCleanup` | reset identity map / state after a request |
 
-### Безопасно без адаптации
+### Safe with no adaptation
 
-Контроллеры, middleware, hydrator/`request-model`, валидация, кэш-бэкенды,
-HTTP-клиент, логгер, mailer, translation-каталоги — либо создаются per-request,
-либо stateless.
+Controllers, middleware, hydrator/`request-model`, validation, cache backends,
+HTTP client, logger, mailer, translation catalogs — either created per request or
+stateless.
+
+### DB driver — only PDO creation differs
+
+In Yii3's `yiisoft/db`, DSN assembly is separated from connection creation:
+`new PDO(...)` is called in exactly one place — `AbstractPdoDriver::createConnection()`
+(public, not `final`). So the driver adapter is trivial — extend
+`Yiisoft\Db\Pgsql\Driver` and override **only** `createConnection()`:
+
+```php
+final class TrueAsyncPgsqlDriver extends \Yiisoft\Db\Pgsql\Driver
+{
+    public function createConnection(): \PDO
+    {
+        // TrueAsync changes the PDO constructor signature:
+        // the password goes into the DSN, arg3 is errmode (int), arg4 is attributes
+        // (including pool options: ATTR_POOL_ENABLED / MIN / MAX / ...).
+        return new \PDO(
+            $this->dsn . ';password=' . $this->password,
+            $this->username,
+            \PDO::ERRMODE_EXCEPTION,
+            $this->attributes,
+        );
+    }
+}
+```
+
+There is no need to wrap `connect()`, `Connection`, or `Schema` — unlike Doctrine
+DBAL in `symfony-spawn`, where the DSN was built inside `connect()` and the whole
+method had to be overridden. Pool attributes reach `$this->attributes` through the
+normal `yiisoft/db` config (PDO constructor arg4).
 
 ---
 
-## 6. Этапы реализации
+## 6. Implementation stages
 
-Каждый этап — самостоятельный, с явным критерием готовности.
+Each stage is self-contained, with an explicit done criterion.
 
-### Этап 0 — каркас репозитория ✅
-`composer.json`, `README.md`, `.gitignore`, `PLAN.md`, структура `src/`.
-**Готово:** репозиторий клонируется, `composer install` проходит.
+### Stage 0 — repository scaffold ✅
+`composer.json`, `README.md`, `.gitignore`, `PLAN.md`, `src/` layout.
+**Done:** the repository clones and `composer install` passes.
 
-### Этап 1 — Runner + Server, single-worker
-`Runtime\TrueAsyncRunner` (реализует `Yiisoft\Yii\Runner\RunnerInterface`),
-`Server\TrueAsyncServer` на `TrueAsync\HttpServer`, мост PSR-7
-(`PsrRequestFactory` / `PsrResponseEmitter`). Контейнер строится через базовый
-`ApplicationRunner`; запрос гоняется через `Yiisoft\Yii\Http\Application::handle()`.
-**Готово:** дефолтное Yii3-приложение отвечает 200 на 1 воркере, без конкурентности.
+### Stage 1 — Runner + Server, single worker
+`Runtime\TrueAsyncRunner` (implements `Yiisoft\Yii\Runner\RunnerInterface`),
+`Server\TrueAsyncServer` on top of `TrueAsync\HttpServer`, the PSR-7 bridge
+(`PsrRequestFactory` / `PsrResponseEmitter`). The container is built via the base
+`ApplicationRunner`; the request runs through `Yiisoft\Yii\Http\Application::handle()`.
+**Done:** the default Yii3 app returns 200 on one worker, without concurrency.
 
-### Этап 2 — многопоточный режим
-Поднятие N воркеров через `spawn_thread` + bootloader (autoload в потоке),
-проброс нужных env-переменных в поток (по образцу `symfony-spawn`).
-**Готово:** N воркеров обслуживают запросы, дефолтный роут стабилен под `h2load`.
+### Stage 2 — multi-threaded mode
+Start N workers via `spawn_thread` + bootloader (autoload inside the thread), pass
+the required env variables into the thread (modeled on `symfony-spawn`).
+**Done:** N workers serve requests; the default route is stable under `h2load`.
 
-### Этап 3 — изоляция per-coroutine состояния
+### Stage 3 — per-coroutine state isolation
 `AsyncCurrentRoute`, `AsyncRequestProvider`, `AsyncViewState`, `AsyncSession`.
-Подмена через config-группу `di-web`, подключаемую раннером.
-**Готово:** конкурентный тест (две корутины с разными маршрутами/сессиями) не
-видит чужого состояния.
+Swapped in via the `di-web` config group wired in by the runner.
+**Done:** a concurrent test (two coroutines with different routes/sessions) sees no
+foreign state.
 
-### Этап 4 — аутентификация
-`AsyncCurrentUser` — identity и кэш проверок прав в `request_context()`.
-**Готово:** конкурентные запросы с разными identity изолированы; флеш-сообщения
-не утекают между корутинами.
+### Stage 4 — authentication
+`AsyncCurrentUser` — identity and permission-check cache in `request_context()`.
+**Done:** concurrent requests with different identities are isolated; flash messages
+do not leak between coroutines.
 
-### Этап 5 — база данных
-`TrueAsyncPgsqlDriver` (PDO-пул TrueAsync; пароль в DSN, errmode третьим
-аргументом — как в `symfony-spawn`), `AsyncTransactionState` для вложенности
-транзакций по корутине, прогрев пула в первой корутине.
-**Готово:** ActiveRecord/`yiisoft/db` работает; конкурентные транзакции не мешают
-друг другу; виден прирост RPS на пуле (см. `feedback_pdo_pool_stmt_cache`).
+### Stage 5 — database
+`TrueAsyncPgsqlDriver` — only `createConnection()` overridden (TrueAsync PDO pool;
+password in DSN, errmode as arg3), `AsyncTransactionState` for per-coroutine
+transaction nesting, pool warm-up in the first coroutine.
+**Done:** ActiveRecord/`yiisoft/db` works; concurrent transactions do not interfere;
+an RPS gain from the pool is visible (see `feedback_pdo_pool_stmt_cache`).
 
-### Этап 6 — гигиена памяти и устойчивость
-Сброс per-request состояния и identity map после запроса; откат «забытых»
-транзакций перед возвратом соединения в пул; firewall на OOM/исключения, чтобы
-воркер не падал в SEGV.
-**Готово:** длительная нагрузка без роста RSS и без падений воркеров.
+### Stage 6 — memory hygiene and resilience
+Reset per-request state and the identity map after a request; roll back any
+transaction left open before returning the connection to the pool; an OOM/exception
+firewall so the worker does not crash with SEGV.
+**Done:** sustained load without RSS growth and without worker crashes.
 
-### Этап 7 — статика, TLS, HTTP/2
-Проброс `StaticHandler`, TLS-листенеров и протоколов через конфиг
-(по образцу `TrueAsyncServer::buildConfig()` из `symfony-spawn`).
-**Готово:** статика, TLS и h2 работают; конфиг покрыт настройками.
+### Stage 7 — static files, TLS, HTTP/2
+Wire `StaticHandler`, TLS listeners, and protocols through config (modeled on
+`TrueAsyncServer::buildConfig()` from `symfony-spawn`).
+**Done:** static files, TLS, and h2 work; config covers the settings.
 
-### Этап 8 — тесты, бенчмарк, документация
-PHPUnit на адаптеры, конкурентные интеграционные тесты, прогон в HttpArena,
-`ADAPTATION.md` (что адаптировано / что небезопасно / как писать async-safe код —
-по образцу `laravel-spawn`).
-**Готово:** CI зелёный, бенчмарк-цифры RPS зафиксированы.
+### Stage 8 — tests, benchmark, documentation
+PHPUnit for the adapters, concurrent integration tests, a HttpArena run,
+`ADAPTATION.md` (what is adapted / what is unsafe / how to write async-safe code —
+modeled on `laravel-spawn`).
+**Done:** CI is green, RPS benchmark numbers are recorded.
 
 ---
 
-## 7. Структура репозитория
+## 7. Repository layout
 
 ```
 yii3-spawn/
 ├── composer.json
 ├── README.md
-├── PLAN.md                  # этот документ
-├── ADAPTATION.md            # появится на этапе 8
-├── config/                  # config-группы Yii3 с подменами синглтонов
+├── PLAN.md                  # this document
+├── ADAPTATION.md            # added in stage 8
+├── config/                  # Yii3 config groups with singleton overrides
 │   └── di-web.php
 ├── src/
 │   ├── Runtime/
@@ -217,37 +249,39 @@ yii3-spawn/
 │   ├── Db/
 │   │   ├── TrueAsyncPgsqlDriver.php
 │   │   └── AsyncTransactionState.php
-│   └── ScopedKey.php         # enum-ключи для request_context()
+│   └── ScopedKey.php         # enum keys for request_context()
 └── tests/
 ```
 
 ---
 
-## 8. Открытые вопросы и риски
+## 8. Open questions and risks
 
-1. **Точные сигнатуры классов Yii3.** Версии `yiisoft/*` (особенно `router`,
-   `user`, `db`) различаются мажорами — на этапе 1 нужно зафиксировать версии в
-   `composer.json` по реальному `yiisoft/app` и сверить интерфейсы.
-2. **`final`-классы.** Если `CurrentRoute` / `Session` объявлены `final`, замена
-   через наследование невозможна — тогда декоратор + DI-делегат (как
-   `AsyncTranslator` в `symfony-spawn`).
-3. **`StateResetter`.** Нужно убедиться, что его сброс не вызывается на общих
-   синглтонах в async-режиме — иначе он затрёт состояние чужой корутины. Вероятно
-   `StateResetter::reset()` в async-раннере не вызываем вовсе.
-4. **Внутренняя статика пакетов Yii3.** Точечно проверить статические свойства в
-   `yiisoft/*` (логирование, профайлинг, error handler) — по образцу
-   PHPStan-правила `MutableStaticPropertyRule` из `laravel-spawn`.
-5. **Совместимость PDO-драйвера.** TrueAsync меняет сигнатуру конструктора `PDO`
-   (пароль в DSN, errmode arg3) — `yiisoft/db-pgsql` `Driver` нужно обернуть, а не
-   использовать как есть.
-6. **Прогрев пула.** Пул PDO создаётся только когда работает планировщик корутин —
-   прогревать в первой корутине, не на этапе boot (см. `symfony-spawn DevServer`).
+1. **Exact Yii3 class signatures.** `yiisoft/*` versions (especially `router`,
+   `user`, `db`) differ across majors — at stage 1 the versions must be pinned in
+   `composer.json` against a real `yiisoft/app` and the interfaces verified.
+2. **`final` classes.** If `CurrentRoute` / `Session` are declared `final`,
+   replacement via inheritance is impossible — then use a decorator + DI delegate
+   (like `AsyncTranslator` in `symfony-spawn`).
+3. **`StateResetter`.** Make sure its reset is not invoked on shared singletons in
+   async mode — otherwise it would clobber another coroutine's state. Most likely
+   `StateResetter::reset()` should not be called at all in the async runner.
+4. **Internal statics in Yii3 packages.** Spot-check static properties across
+   `yiisoft/*` (logging, profiling, error handler) — modeled on the
+   `MutableStaticPropertyRule` PHPStan rule from `laravel-spawn`.
+5. **PDO driver.** TrueAsync changes the `PDO` constructor signature (password in
+   DSN, errmode as arg3). In Yii3 this is contained to a single method —
+   `AbstractPdoDriver::createConnection()` — so only that one method is overridden
+   (see §5), no wider wrapping needed.
+6. **Pool warm-up.** The PDO pool is created only while the coroutine scheduler is
+   running — warm it up in the first coroutine, not at boot time (see the
+   `symfony-spawn` `DevServer`).
 
 ---
 
-## 9. Ссылки
+## 9. References
 
 - TrueAsync server — https://github.com/true-async/server
 - PHP TrueAsync — https://github.com/true-async/php-async
-- Образцы адаптеров — `~/symfony-spawn`, `~/laravel-spawn`
+- Adapter examples — `~/symfony-spawn`, `~/laravel-spawn`
 - Yii3 HTTP runner — `yiisoft/yii-runner-http`, `yiisoft/yii-runner-roadrunner`
