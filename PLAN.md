@@ -35,7 +35,7 @@ The TrueAsync server (`TrueAsync\HttpServer`) is a multi-threaded coroutine HTTP
 
 | Layer | Purpose |
 |---|---|
-| **Runtime / Runner** | entry point; starts workers via `spawn_thread`, builds the framework kernel in each and launches `HttpServer` |
+| **Runtime / Runner** | entry point; configures `HttpServer`, builds the framework container per worker, launches the server's built-in worker pool |
 | **Server adapter** | converts `TrueAsync\HttpRequest` ↔ the framework request object and back for the response |
 | **Per-coroutine adapters** | wrap stateful singletons, moving their mutable state into `request_context()` |
 | **DB pool + transactions** | enable the TrueAsync C-level PDO pool and isolate transaction nesting per coroutine |
@@ -174,16 +174,22 @@ Each stage is self-contained, with an explicit done criterion.
 `composer.json`, `README.md`, `.gitignore`, `PLAN.md`, `src/` layout.
 **Done:** the repository clones and `composer install` passes.
 
-### Stage 1 — Runner + Server, single worker
-`Runtime\TrueAsyncRunner` (implements `Yiisoft\Yii\Runner\RunnerInterface`),
-`Server\TrueAsyncServer` on top of `TrueAsync\HttpServer`, the PSR-7 bridge
-(`PsrRequestFactory` / `PsrResponseEmitter`). The container is built via the base
-`ApplicationRunner`; the request runs through `Yiisoft\Yii\Http\Application::handle()`.
-**Done:** the default Yii3 app returns 200 on one worker, without concurrency.
+### Stage 1 — Runner + Server, single worker ✅ (code complete)
+`Runtime\TrueAsyncRunner` (extends `ApplicationRunner`, implements
+`Yiisoft\Yii\Runner\RunnerInterface`), `Server\TrueAsyncServer` on top of
+`TrueAsync\HttpServer`, the PSR-7 bridge (`PsrRequestFactory` / `PsrResponseEmitter`).
+The container is built via the base `ApplicationRunner` (the `*-web` config groups);
+the request runs through `Yiisoft\Yii\Http\Application::handle()`. `TrueAsync\*` IDE
+stubs vendored under `stubs/`.
+**Done:** code complete, lint + PHPStan (level 6) clean. The live "returns 200"
+smoke test is pending a demo Yii3 app + the running server extension.
 
-### Stage 2 — multi-threaded mode
-Start N workers via `spawn_thread` + bootloader (autoload inside the thread), pass
-the required env variables into the thread (modeled on `symfony-spawn`).
+### Stage 2 — multi-worker mode
+Use the server's built-in worker pool — `HttpServerConfig::setWorkers(N)` +
+`setBootloader()` (per-worker Composer autoload). No manual `spawn_thread`: the
+server replicates the config + handler to each worker and the container is built
+lazily per worker on the first request. The wiring already exists in
+`TrueAsyncServer`; this stage validates and hardens it.
 **Done:** N workers serve requests; the default route is stable under `h2load`.
 
 ### Stage 3 — per-coroutine state isolation

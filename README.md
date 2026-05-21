@@ -28,9 +28,22 @@ composer require true-async/yii3-spawn
 
 ## Running
 
-```bash
-php yii serve            # or the runner wired into public/index.php
+Wire the runner into your Yii3 project's `public/index.php` (see
+[`examples/index.php`](examples/index.php)):
+
+```php
+use TrueAsync\Yii3\Runtime\TrueAsyncRunner;
+
+require_once dirname(__DIR__) . '/vendor/autoload.php';
+
+(new TrueAsyncRunner(
+    rootPath: dirname(__DIR__),
+    serverOptions: ['host' => '0.0.0.0', 'port' => 8080, 'workers' => 1],
+))->run();
 ```
+
+`workers > 1` enables the TrueAsync server's built-in worker pool — no manual
+thread spawning.
 
 See [PLAN.md](PLAN.md) for architecture, the list of adapted components, and the
 implementation roadmap.
