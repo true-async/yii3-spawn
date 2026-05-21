@@ -11,7 +11,7 @@ use TrueAsync\HttpRequest;
 use TrueAsync\HttpResponse;
 use TrueAsync\HttpServer;
 use TrueAsync\HttpServerConfig;
-use Yiisoft\Yii\Http\Application;
+use TrueAsync\Yii3\Runtime\WorkerRuntime;
 
 use function is_file;
 use function microtime;
@@ -24,17 +24,15 @@ use function sprintf;
  * TrueAsync request/response to the Yii3 PSR-7 middleware stack.
  *
  * Concurrency model: with more than one worker the server's built-in pool
- * deep-copies this object into each worker thread (no manual `spawn_thread`).
- * The container is therefore built lazily, per worker, on the first request —
- * `$containerFactory` must not be invoked before {@see start()}.
+ * deep-copies the config + handler into each worker thread (no manual
+ * `spawn_thread`). The container is built once per worker, eagerly, in the
+ * bootloader — before that worker accepts any request. For a single worker
+ * the same bootstrap runs in the calling thread before {@see HttpServer::start()}.
  */
 final class TrueAsyncServer
 {
     private readonly PsrRequestFactory $requestFactory;
     private readonly PsrResponseEmitter $responseEmitter;
-
-    private ?ContainerInterface $container = null;
-    private ?Application $application = null;
 
     /**
      * @param array<string, mixed> $options Server options (host, port, workers, debug, autoload).
@@ -56,10 +54,17 @@ final class TrueAsyncServer
             (int) ($this->options['port'] ?? 8080),
         );
 
+        $bootstrap = $this->bootstrap();
         $workers = (int) ($this->options['workers'] ?? 1);
+
         if ($workers > 1) {
+            // Multi-worker: the server runs the bootloader on each worker
+            // thread before its task loop starts accepting requests.
             $config->setWorkers($workers);
-            $config->setBootloader($this->bootloader());
+            $config->setBootloader($bootstrap);
+        } else {
+            // Single worker: build the container in the calling thread.
+            $bootstrap();
         }
 
         $server = new HttpServer($config);
@@ -72,11 +77,12 @@ final class TrueAsyncServer
         try {
             $request->awaitBody();
 
-            $application = $this->application();
             $psrRequest = $this->requestFactory->create($request)
                 ->withAttribute('applicationStartTime', microtime(true));
 
+            $application = WorkerRuntime::application();
             $psrResponse = $application->handle($psrRequest);
+
             $this->responseEmitter->emit($psrResponse, $response);
             $application->afterEmit($psrResponse);
         } catch (Throwable $e) {
@@ -85,35 +91,20 @@ final class TrueAsyncServer
     }
 
     /**
-     * Builds the container and Yii3 application once per worker, then caches them.
+     * Per-worker bootstrap: restores the Composer autoloader inside the
+     * freshly spawned worker thread, then builds the container eagerly.
      */
-    private function application(): Application
-    {
-        if ($this->application === null) {
-            $this->container = ($this->containerFactory)();
-
-            /** @var Application $application */
-            $application = $this->container->get(Application::class);
-            $application->start();
-
-            $this->application = $application;
-        }
-
-        return $this->application;
-    }
-
-    /**
-     * Per-worker bootloader: restores the Composer autoloader inside the
-     * freshly spawned worker thread before its task loop starts.
-     */
-    private function bootloader(): Closure
+    private function bootstrap(): Closure
     {
         $autoload = (string) ($this->options['autoload'] ?? '');
+        $containerFactory = $this->containerFactory;
 
-        return static function () use ($autoload): void {
+        return static function () use ($autoload, $containerFactory): void {
             if ($autoload !== '' && is_file($autoload)) {
                 require_once $autoload;
             }
+
+            WorkerRuntime::boot($containerFactory);
         };
     }
 

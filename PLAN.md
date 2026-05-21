@@ -116,6 +116,7 @@ isolation.
 | Component | Adapter (`TrueAsync\Yii3\…`) | What is isolated |
 |---|---|---|
 | Runner | `Runtime\TrueAsyncRunner` | entry point: workers + `HttpServer` |
+| Worker runtime | `Runtime\WorkerRuntime` | per-worker container/`Application`, built once in the bootloader |
 | Server | `Server\TrueAsyncServer` | `HttpRequest` ↔ PSR-7 ↔ `HttpResponse` |
 | PSR-7 bridge | `Server\PsrRequestFactory` / `PsrResponseEmitter` | request/response conversion |
 | Current route | `Router\AsyncCurrentRoute` | matched route per coroutine |
@@ -178,18 +179,22 @@ Each stage is self-contained, with an explicit done criterion.
 `Runtime\TrueAsyncRunner` (extends `ApplicationRunner`, implements
 `Yiisoft\Yii\Runner\RunnerInterface`), `Server\TrueAsyncServer` on top of
 `TrueAsync\HttpServer`, the PSR-7 bridge (`PsrRequestFactory` / `PsrResponseEmitter`).
-The container is built via the base `ApplicationRunner` (the `*-web` config groups);
-the request runs through `Yiisoft\Yii\Http\Application::handle()`. `TrueAsync\*` IDE
-stubs vendored under `stubs/`.
+The container is built via the base `ApplicationRunner` (the `*-web` config groups)
+and held per worker by `Runtime\WorkerRuntime`; the request runs through
+`Yiisoft\Yii\Http\Application::handle()`. `TrueAsync\*` IDE stubs vendored under
+`stubs/`.
 **Done:** code complete, lint + PHPStan (level 6) clean. The live "returns 200"
 smoke test is pending a demo Yii3 app + the running server extension.
 
 ### Stage 2 — multi-worker mode
 Use the server's built-in worker pool — `HttpServerConfig::setWorkers(N)` +
-`setBootloader()` (per-worker Composer autoload). No manual `spawn_thread`: the
-server replicates the config + handler to each worker and the container is built
-lazily per worker on the first request. The wiring already exists in
-`TrueAsyncServer`; this stage validates and hardens it.
+`setBootloader()`. No manual `spawn_thread`: the server replicates the config +
+handler to each worker. The container is built **eagerly in the per-worker
+bootloader** (Composer autoload + `WorkerRuntime::boot()`), before that worker
+accepts any request — this avoids both a first-request latency spike and the race
+that lazy "build on first request" would create under coroutine-per-request
+concurrency. The wiring already exists in `TrueAsyncServer`; this stage validates
+and hardens it.
 **Done:** N workers serve requests; the default route is stable under `h2load`.
 
 ### Stage 3 — per-coroutine state isolation
