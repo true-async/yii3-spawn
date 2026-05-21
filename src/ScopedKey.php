@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace TrueAsync\Yii3;
 
 /**
- * Keys for per-coroutine state stored in Async\current_context().
+ * Keys for per-coroutine state stored in Async\request_context().
  *
  * Enum cases as object keys guarantee uniqueness across libraries and let
  * static analysis find every place scoped state is read or written.

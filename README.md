@@ -11,7 +11,7 @@ application on the [TrueAsync HTTP server](https://github.com/true-async/server)
 A standard Yii3 application is built once per worker. The TrueAsync server then handles
 many HTTP requests **concurrently** inside that single worker — each request runs in its
 own coroutine. `yii3-spawn` makes the stateful Yii3 singletons safe under that concurrency
-by backing their per-request state with `Async\current_context()`, so application code
+by backing their per-request state with `Async\request_context()`, so application code
 keeps working unchanged.
 
 ## Requirements
